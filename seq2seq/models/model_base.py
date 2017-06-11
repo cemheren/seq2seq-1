@@ -93,6 +93,8 @@ class ModelBase(Configurable):
 
   def _build_train_op(self, loss):
     """Creates the training operation"""
+    colocate_gradients_with_ops = self.params["training.data_parallelism"] > 1
+
     learning_rate_decay_fn = training_utils.create_learning_rate_decay_fn(
         decay_type=self.params["optimizer.lr_decay_type"] or None,
         decay_steps=self.params["optimizer.lr_decay_steps"],
@@ -110,7 +112,8 @@ class ModelBase(Configurable):
         learning_rate_decay_fn=learning_rate_decay_fn,
         clip_gradients=self._clip_gradients,
         optimizer=optimizer,
-        summaries=["learning_rate", "loss", "gradients", "gradient_norm"])
+        summaries=["learning_rate", "loss", "gradients", "gradient_norm"],
+        colocate_gradients_with_ops=colocate_gradients_with_ops)
 
     return train_op
 
@@ -131,11 +134,84 @@ class ModelBase(Configurable):
         "optimizer.clip_gradients": 5.0,
         "optimizer.sync_replicas": 0,
         "optimizer.sync_replicas_to_aggregate": 0,
+        "training.data_parallelism": 0
     }
 
   def batch_size(self, features, labels):
     """Returns the batch size for a batch of examples"""
     raise NotImplementedError()
+
+  def _build_parallel(self, features, labels, params):
+    """Builds one or more model replicas on GPU devices. If
+    `training.data_parallelism` is set to 0 this function does nothing and
+    just calls the build method.
+
+    If `training.data_parallelism` is >= 1 and not enough GPUs are
+    available this will throw an error.
+
+    If `training.data_parallelism` = N >= 1 and enough GPUs are available this
+    will create a model replica on each GPU andsplit the training batch into
+    N pieces, merge the predictions and average the losses.
+
+    If model is not in training mode this does nothing and just calls the
+    build method.
+    """
+    parallelism = self.params["training.data_parallelism"]
+
+    # Create model template function
+    template_build = tf.make_template(
+        self.name, self._build, create_scope_now_=True)
+
+    # Data parallelism is disabled
+    if parallelism <= 0:
+      with tf.variable_scope(self.name):
+        return template_build(features, labels, params)
+
+    # Not training
+    if self.mode != tf.contrib.learn.ModeKeys.TRAIN:
+      with tf.variable_scope(self.name):
+        return template_build(features, labels, params)
+
+    # Data parallelism is enabled
+    available_gpus = training_utils.get_available_gpus()
+    tf.logging.info("Available GPUs: %s", available_gpus)
+
+    # Make sure we have enough GPUs
+    if len(available_gpus) < parallelism:
+      raise ValueError(
+          "Data Parallelism set to {}, but only {} GPUs available""".format(
+              parallelism, len(available_gpus)))
+
+    # Split all features and labels
+    features_split = {k: tf.split(v, parallelism) for k, v in features.items()}
+    labels_split = {k: tf.split(v, parallelism) for k, v in labels.items()}
+    tf.logging.info(features_split)
+
+    all_losses = []
+    all_predictions = []
+
+    for idx in range(parallelism):
+      # Create each model replica
+      gpu_device = available_gpus[idx]
+      tf.logging.info("Creating replica %d on device %s", idx, gpu_device)
+      with tf.device(gpu_device):
+        rep_features = {k: v[idx] for k, v in features_split.items()}
+        rep_labels = {k: v[idx] for k, v in labels_split.items()}
+        rep_pred, rep_loss = template_build(rep_features, rep_labels, params)
+        all_losses.append(rep_loss)
+        all_predictions.append(rep_pred)
+
+    # Concat all predictions
+    prediction_keys = all_predictions[0].keys()
+    predictions = {
+        k: tf.concat([_[k] for _ in all_predictions], 0)
+        for k in prediction_keys
+    }
+
+    # Take the average loss
+    loss = tf.reduce_mean(all_losses)
+
+    return predictions, loss
 
   def __call__(self, features, labels, params):
     """Creates the model graph. See the model_fn documentation in
@@ -143,10 +219,16 @@ class ModelBase(Configurable):
     """
     with tf.variable_scope("model"):
       with tf.variable_scope(self.name):
-        return self._build(features, labels, params)
+        predictions, loss = self._build_parallel(features, labels, params)
+        if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
+          train_op = self._build_train_op(loss)
+        else:
+          train_op = None
+    return predictions, loss, train_op
 
   def _build(self, features, labels, params):
     """Subclasses should implement this method. See the `model_fn` documentation
-    in tf.contrib.learn.Estimator class for a more detailed explanation.
+    in tf.contrib.learn.Estimator class for a more detailed explanation. This
+    function should return a tuple of (predictions, loss)
     """
     raise NotImplementedError

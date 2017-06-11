@@ -247,6 +247,11 @@ class Seq2SeqModel(ModelBase):
           "target.max_seq_len"]]
       labels["target_len"] = tf.minimum(labels["target_len"],
                                         self.params["target.max_seq_len"])
+      # Slice up to longest example in this batch.
+      # This is required for multi-gpu training where each batch is split
+      # across replicas
+      labels["target_tokens"] = labels["target_tokens"][:, :tf.reduce_max(
+          labels["target_len"])]
 
     # Look up the target ids in the vocabulary
     labels["target_ids"] = target_vocab_to_id.lookup(labels["target_tokens"])
@@ -255,9 +260,10 @@ class Seq2SeqModel(ModelBase):
     tf.summary.histogram("target_len", tf.to_float(labels["target_len"]))
 
     # Keep track of the number of processed tokens
-    num_tokens = tf.reduce_sum(labels["target_len"])
-    num_tokens += tf.reduce_sum(features["source_len"])
-    token_counter_var = tf.Variable(0, "tokens_counter")
+    num_tokens = tf.to_int64(tf.reduce_sum(labels["target_len"]))
+    num_tokens += tf.to_int64(tf.reduce_sum(features["source_len"]))
+    token_counter_var = tf.get_variable("tokens_counter", [],
+        dtype=tf.int64, initializer=tf.constant_initializer(0))
     total_tokens = tf.assign_add(token_counter_var, num_tokens)
     tf.summary.scalar("num_tokens", total_tokens)
 
@@ -301,13 +307,8 @@ class Seq2SeqModel(ModelBase):
       predictions = self._create_predictions(
           decoder_output=decoder_output, features=features, labels=labels)
       loss = None
-      train_op = None
     else:
       losses, loss = self.compute_loss(decoder_output, features, labels)
-
-      train_op = None
-      if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
-        train_op = self._build_train_op(loss)
 
       predictions = self._create_predictions(
           decoder_output=decoder_output,
@@ -319,4 +320,4 @@ class Seq2SeqModel(ModelBase):
     # can easly find them in our hooks/monitors.
     graph_utils.add_dict_to_collection(predictions, "predictions")
 
-    return predictions, loss, train_op
+    return predictions, loss
