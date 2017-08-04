@@ -32,6 +32,9 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import gfile
 
+import matplotlib
+matplotlib.use('Agg')
+
 from seq2seq.test import utils as test_utils
 
 BIN_FOLDER = os.path.abspath(
